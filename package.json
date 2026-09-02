@@ -1,0 +1,28 @@
+{
+  "name": "airline-reservation-concurrent-seat-locking",
+  "version": "1.0.0",
+  "description": "Airline Reservation & Concurrent Seat-Locking System (Node.js + Express + PostgreSQL)",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "seed": "node scripts/seed.js",
+    "test:concurrency": "node tests/concurrency-test.js",
+    "test:api": "node tests/api-smoke-test.js"
+  },
+  "keywords": [
+    "airline",
+    "reservation",
+    "postgresql",
+    "concurrency",
+    "row-level-locking"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pg": "^8.11.5"
+  }
+}

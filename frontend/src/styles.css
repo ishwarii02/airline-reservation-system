@@ -1,0 +1,297 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  color: #1a1a1a;
+  background: #fafafa;
+}
+
+.app {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 24px 20px 60px;
+}
+
+.app-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 16px;
+  border-bottom: 1px solid #ddd;
+  padding-bottom: 16px;
+  margin-bottom: 24px;
+}
+
+.app-header h1 {
+  font-size: 20px;
+  margin: 0 0 4px;
+}
+
+.subtitle {
+  font-size: 13px;
+  color: #666;
+  margin: 0;
+}
+
+.subtitle code {
+  background: #eee;
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+}
+
+.tab {
+  background: none;
+  border: 1px solid transparent;
+  padding: 7px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  border-radius: 5px;
+  color: #444;
+}
+
+.tab:hover {
+  background: #eee;
+}
+
+.tab.active {
+  background: #1a1a1a;
+  color: #fff;
+}
+
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.panel {
+  background: #fff;
+  border: 1px solid #e2e2e2;
+  border-radius: 8px;
+  padding: 18px 20px;
+}
+
+.panel h2 {
+  font-size: 16px;
+  margin: 0 0 14px;
+}
+
+.panel h3 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: #666;
+  margin: 20px 0 10px;
+}
+
+.form-row {
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+
+.form-row label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: #555;
+}
+
+input {
+  padding: 6px 8px;
+  border: 1px solid #ccc;
+  border-radius: 5px;
+  font-size: 13px;
+}
+
+button {
+  padding: 7px 13px;
+  border-radius: 5px;
+  border: 1px solid #1a1a1a;
+  background: #1a1a1a;
+  color: #fff;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: #333;
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.hint {
+  font-size: 12px;
+  color: #777;
+}
+
+.error {
+  color: #b3261e;
+  font-size: 13px;
+  background: #fdecea;
+  border: 1px solid #f4c7c3;
+  padding: 8px 10px;
+  border-radius: 5px;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.table th {
+  text-align: left;
+  font-size: 11px;
+  text-transform: uppercase;
+  color: #888;
+  padding: 6px 8px;
+  border-bottom: 1px solid #ddd;
+}
+
+.table td {
+  padding: 8px;
+  border-bottom: 1px solid #eee;
+}
+
+.row-selected {
+  background: #f5f5f5;
+}
+
+.empty {
+  color: #888;
+  text-align: center;
+  padding: 16px;
+}
+
+/* Seat grid */
+.seat-grid {
+  margin: 10px 0;
+}
+
+.seat-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 5px;
+}
+
+.row-label {
+  width: 18px;
+  font-size: 11px;
+  color: #888;
+  text-align: right;
+}
+
+.seat {
+  width: 36px;
+  height: 32px;
+  border-radius: 4px;
+  border: 1px solid #ccc;
+  background: #fff;
+  font-size: 11px;
+  color: #333;
+  cursor: pointer;
+}
+
+.seat:nth-child(3) {
+  margin-right: 10px; /* aisle gap after seat B */
+}
+
+.seat-selected {
+  background: #1a1a1a;
+  color: #fff;
+  border-color: #1a1a1a;
+}
+
+.seat-locked {
+  background: #fff3cd;
+  border-color: #e0c15c;
+  color: #8a6d1a;
+}
+
+.seat-booked {
+  background: #f3d4d1;
+  border-color: #d99a92;
+  color: #8a2f24;
+}
+
+.seat-legend {
+  display: flex;
+  gap: 16px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: #666;
+}
+
+.dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  margin-right: 5px;
+  border: 1px solid #ccc;
+}
+
+.dot-available { background: #fff; }
+.dot-selected { background: #1a1a1a; border-color: #1a1a1a; }
+.dot-locked { background: #fff3cd; border-color: #e0c15c; }
+.dot-booked { background: #f3d4d1; border-color: #d99a92; }
+
+/* Badges */
+.badge {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 20px;
+  font-weight: 600;
+}
+
+.badge-PENDING, .badge-LOCKED { background: #fff3cd; color: #8a6d1a; }
+.badge-CONFIRMED, .badge-SUCCESS, .badge-WON, .badge-AVAILABLE { background: #d9f2e3; color: #1f7a44; }
+.badge-FAILED, .badge-CANCELLED, .badge-LOST { background: #f3d4d1; color: #8a2f24; }
+.badge-BOOKED { background: #f3d4d1; color: #8a2f24; }
+.badge-REFUNDED { background: #dbe4f3; color: #2a4d8a; }
+
+.booking-card h2 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.stat-row {
+  display: flex;
+  gap: 28px;
+  margin: 12px 0 18px;
+}
+
+.stat {
+  display: flex;
+  flex-direction: column;
+}
+
+.stat-num {
+  font-size: 24px;
+  font-weight: 700;
+}
+
+.stat-label {
+  font-size: 11px;
+  color: #777;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
