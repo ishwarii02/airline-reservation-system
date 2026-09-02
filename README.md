@@ -5,14 +5,41 @@ seats, and paying for them, built to demonstrate **preventing two users
 from booking the same seat at the same time** using PostgreSQL
 transactions and row-level pessimistic locking (`SELECT ... FOR UPDATE`).
 
-Stack: **Node.js + Express.js + PostgreSQL** (raw SQL via `pg`, no ORM).
+**Stack:** Node.js · Express.js · PostgreSQL (raw SQL via `pg`, no ORM)
+
 No Redis, no queues, no microservices — on purpose. The whole point of
 the project is to be interview-defensible: every line can be explained.
 
-A minimal React client lives in `frontend/` purely as a demo surface over
-this API — it holds no business logic of its own (see `frontend/README.md`).
-Everything in this document still describes the backend, which is the
-actual subject of the project.
+A minimal React client lives in [`frontend/`](frontend/README.md) purely
+as a demo surface over this API — it holds no business logic of its own.
+Everything in this document describes the backend, which is the actual
+subject of the project.
+
+### At a glance
+
+| | |
+|---|---|
+| **Core guarantee** | Exactly one booking wins a contested seat, proven under real concurrent load |
+| **Mechanism** | Row-level pessimistic locking (`SELECT ... FOR UPDATE`) inside explicit transactions |
+| **Isolation level** | PostgreSQL default `READ COMMITTED` — correctness comes from the row lock, not snapshot isolation |
+| **Tested** | `tests/api-smoke-test.js` (15/15 assertions) · `tests/concurrency-test.js` at 5/10/20 concurrent requesters, exactly 1 success every time |
+| **Deliberately out of scope** | Auth/JWT, optimistic locking, real payment gateway, caching, horizontal scaling (see [§1](#1-why-this-project-exists)) |
+
+---
+
+## Contents
+
+1. [Why this project exists](#1-why-this-project-exists)
+2. [Architecture](#2-architecture)
+3. [ER diagram](#3-er-diagram)
+4. [Schema decisions](#4-schema-decisions-why-its-shaped-this-way)
+5. [Booking / transaction flow](#5-booking--transaction-flow)
+6. [Concurrency: how "exactly one succeeds" is guaranteed](#6-concurrency-how-exactly-one-booking-succeeds-is-actually-guaranteed)
+7. [What was actually tested](#7-what-was-actually-tested-before-packaging)
+8. [Setup instructions](#8-setup-instructions)
+9. [Project structure](#9-project-structure)
+10. [Interview questions this project should be able to answer](#10-interview-questions-this-project-should-be-able-to-answer)
+11. [Environment variables](#11-environment-variables-env)
 
 ---
 
@@ -23,7 +50,7 @@ free, both write" race condition. This project's entire design revolves
 around solving that one problem correctly and being able to prove it —
 not around adding features.
 
-What's implemented:
+**What's implemented:**
 - Flight search
 - Seat availability per flight
 - Temporary seat locking when a booking starts (`PENDING`)
@@ -35,7 +62,7 @@ What's implemented:
   seat, exactly 1 succeeds
 - A handful of SQL analytics queries (occupancy, revenue)
 
-What's deliberately **not** implemented (out of scope, listed so it's
+**What's deliberately not implemented** (out of scope, listed so it's
 clear this was a decision, not an oversight): optimistic locking /
 version-column comparison, deadlock experiments, authentication/JWT,
 seat maps per aircraft type, multi-currency, real payment gateway
@@ -46,7 +73,7 @@ integration, caching layer, horizontal scaling.
 ## 2. Architecture
 
 ```
-Client (curl / Postman / test scripts)
+Client (curl / Postman / test scripts / frontend/)
         │  HTTP (JSON)
         ▼
 Express routes  →  Controllers  →  Services  →  pg Pool  →  PostgreSQL
@@ -54,15 +81,15 @@ Express routes  →  Controllers  →  Services  →  pg Pool  →  PostgreSQL
                                       + transactions live here)
 ```
 
-- **routes/** just wire an HTTP verb + path to a controller function.
-- **controllers/** parse the request, call a service, shape the response.
+- **`routes/`** just wire an HTTP verb + path to a controller function.
+- **`controllers/`** parse the request, call a service, shape the response.
   No SQL, no transaction logic here.
-- **services/booking.service.js** is where everything that matters
+- **`services/booking.service.js`** is where everything that matters
   happens: every multi-statement operation is wrapped in a single
   PostgreSQL transaction via `withTransaction()` in `src/db/pool.js`.
-- **services/payment.service.js** simulates an external payment gateway
+- **`services/payment.service.js`** simulates an external payment gateway
   (random ~90% success by default, or a forced outcome for tests/demos).
-- **services/lock-cleanup.service.js** is a background job (`setInterval`,
+- **`services/lock-cleanup.service.js`** is a background job (`setInterval`,
   also callable via an endpoint) that releases seats whose lock has
   outlived `SEAT_LOCK_TIMEOUT_MINUTES` without being confirmed.
 
@@ -72,7 +99,7 @@ the project, not add value.
 
 ---
 
-## 3. ER Diagram
+## 3. ER diagram
 
 ```
 passenger ───┐
@@ -180,7 +207,7 @@ erDiagram
   per flight, price doesn't get stored redundantly on `seat`.
 
 - **`flight_seat.status` (`AVAILABLE` / `LOCKED` / `BOOKED`) is the
-  single source of truth for "is this seat takeable right now".** It is
+  single source of truth for "is this seat takeable right now."** It is
   also the row every booking attempt locks with `FOR UPDATE`. Putting
   the mutable, contended state on its own narrow row (rather than, say,
   deriving availability by scanning `booking_seat`) is what makes
@@ -200,13 +227,14 @@ erDiagram
   invariant that actually matters — *at most one active claim on a seat
   at a time* — is enforced by the `flight_seat.status` state machine
   under a row lock, not by a static schema constraint. (This is a good
-  interview question, see §8.)
+  interview question — see [§10](#10-interview-questions-this-project-should-be-able-to-answer).)
 
 - **`CHECK` constraints do real validation at the DB level**, not just
   in application code: `source <> destination`, `arrival_time >
   departure_time`, positive prices/amounts, and enumerated status values
   for `flight_seat.status`, `booking.booking_status`, `payment.status`,
-  `seat.seat_class`. Verified directly against the running DB (see §7).
+  `seat.seat_class`. Verified directly against the running DB (see
+  [§7](#7-what-was-actually-tested-before-packaging)).
 
 - **`payment` has a `UNIQUE` FK on `booking_id`.** One booking gets at
   most one payment attempt recorded per confirmation call (a booking
@@ -327,8 +355,9 @@ A holds 1A and waits for 1B while B holds 1B and waits for 1A. The fix
 used here is `ORDER BY fs.flight_seat_id` in the locking `SELECT` —
 every transaction always acquires locks in the same global order (by
 primary key), so this specific deadlock pattern can't occur. Verified
-manually (see §7) with two transactions requesting the same two seats in
-reversed order — no deadlock, one wins cleanly with the other rejected.
+manually (see [§7](#7-what-was-actually-tested-before-packaging)) with
+two transactions requesting the same two seats in reversed order — no
+deadlock, one wins cleanly with the other rejected.
 
 ### 6.4 Isolation level
 
@@ -338,8 +367,9 @@ correctness relies on explicit row locks (`FOR UPDATE`), not on
 snapshot isolation — `FOR UPDATE` makes each transaction re-check the
 row's latest committed state after the lock is granted, which is
 exactly the guarantee needed. (A pure optimistic/`SERIALIZABLE`
-approach would be a different, equally valid design — see §8 for the
-trade-off discussion.)
+approach would be a different, equally valid design — see
+[§10](#10-interview-questions-this-project-should-be-able-to-answer)
+for the trade-off discussion.)
 
 ### 6.5 Proof: the concurrency test
 
@@ -362,7 +392,8 @@ PASS: exactly one passenger won the seat; all others were correctly rejected.
 ```
 
 Tested at 5, 10, and 20 simultaneous requesters — result is always
-exactly 1 success. This is the artifact to show in an interview.
+exactly 1 success. **This is the artifact to show in an interview** —
+or, live, the Concurrency test tab in `frontend/`.
 
 ---
 
@@ -463,7 +494,8 @@ npm run dev
 ```
 
 Requires the backend from step 7 to already be running. Details in
-`frontend/README.md`.
+[`frontend/README.md`](frontend/README.md) — the Concurrency test tab
+fires real simultaneous requests at the live server, no simulation.
 
 ### Quick manual API tour
 
@@ -487,30 +519,30 @@ curl "http://localhost:3000/api/analytics/revenue"
 ```
 airline-reservation-system/
 ├── sql/
-│   ├── 00_create_db.sql          role + database creation
-│   ├── 01_schema.sql             tables, PKs, FKs, CHECK/UNIQUE constraints
+│   ├── 00_create_db.sql           role + database creation
+│   ├── 01_schema.sql              tables, PKs, FKs, CHECK/UNIQUE constraints
 │   ├── 02_constraints_indexes.sql triggers + read views
-│   ├── 03_seed.sql               sample passengers/flights/seats
-│   └── 04_analytics_queries.sql  standalone occupancy/revenue queries
+│   ├── 03_seed.sql                sample passengers/flights/seats
+│   └── 04_analytics_queries.sql   standalone occupancy/revenue queries
 ├── src/
 │   ├── config.js
-│   ├── app.js                    Express app + central error handler
-│   ├── server.js                 entrypoint
-│   ├── db/pool.js                pg Pool + withTransaction() helper
-│   ├── routes/                   thin route -> controller wiring
-│   ├── controllers/               HTTP parsing/shaping only
+│   ├── app.js                     Express app + central error handler
+│   ├── server.js                  entrypoint
+│   ├── db/pool.js                 pg Pool + withTransaction() helper
+│   ├── routes/                    thin route -> controller wiring
+│   ├── controllers/                HTTP parsing/shaping only
 │   ├── services/
-│   │   ├── booking.service.js     ALL transaction/locking logic
-│   │   ├── payment.service.js     simulated payment gateway
-│   │   └── lock-cleanup.service.js  expired-lock release job
+│   │   ├── booking.service.js      ALL transaction/locking logic
+│   │   ├── payment.service.js      simulated payment gateway
+│   │   └── lock-cleanup.service.js expired-lock release job
 │   └── utils/
 ├── tests/
-│   ├── concurrency-test.js        THE demo: N users race for 1 seat
-│   └── api-smoke-test.js          full lifecycle end-to-end test
+│   ├── concurrency-test.js         THE demo: N users race for 1 seat
+│   └── api-smoke-test.js           full lifecycle end-to-end test
 ├── scripts/
 │   ├── seed.js
 │   └── reset-db.sh
-├── frontend/                     minimal React/Vite demo client (see frontend/README.md)
+├── frontend/                      React/Vite demo client (see frontend/README.md)
 ├── .env.example
 └── README.md
 ```
@@ -523,7 +555,7 @@ airline-reservation-system/
 `SELECT ... FOR UPDATE` inside a transaction on the `flight_seat` row.
 It's a row-level exclusive lock held until COMMIT/ROLLBACK; a second
 transaction requesting the same row blocks until the first finishes,
-then re-reads the current (not stale) status. See §6.1.
+then re-reads the current (not stale) status. See [§6.1](#61-the-mechanism).
 
 **Q: Why pessimistic locking instead of optimistic locking (a version
 column + compare-and-swap)?**
@@ -543,14 +575,15 @@ auto-expire via the cleanup job if a client disappears mid-flow.
 **Q: What if a user locks a seat and then never confirms or cancels?**
 The seat stays `LOCKED`, unbookable by anyone else, until
 `lock-cleanup.service.js` runs and releases anything past
-`SEAT_LOCK_TIMEOUT_MINUTES`. See §5.4.
+`SEAT_LOCK_TIMEOUT_MINUTES`. See [§5.4](#54-expired-lock-cleanup).
 
 **Q: How do you know the fix actually works, not just "should work in
 theory"?**
 `tests/concurrency-test.js` fires real concurrent HTTP requests (not a
 single-threaded simulation) at the same seat and asserts exactly one
 `201` and the rest `409`. Run at 5/10/20 concurrent requesters with
-consistent results — see §6.5 and §7.
+consistent results — see [§6.5](#65-proof-the-concurrency-test) and
+[§7](#7-what-was-actually-tested-before-packaging).
 
 **Q: Why is `flight_seat` a separate table from `seat`?**
 Because status and price are per-flight, not per-seat-globally — seat
@@ -559,7 +592,7 @@ today's, and business class seats cost more only because of a
 multiplier applied when the flight_seat row is created. Splitting them
 is what keeps the design in 3NF instead of duplicating seat metadata
 per flight or storing a flight-varying fact on a flight-independent
-table. See §4.
+table. See [§4](#4-schema-decisions-why-its-shaped-this-way).
 
 **Q: Why doesn't `booking_seat` have a UNIQUE constraint on
 `flight_seat_id`?**
@@ -569,8 +602,8 @@ again by someone else — those are two different, both-valid
 times. The actual invariant — *no two simultaneously active bookings
 on one seat* — is a runtime state-machine property (`flight_seat.status`
 guarded by the row lock), not something a static uniqueness constraint
-can express, because uniqueness constraints can't see "still active".
-See §4.
+can express, because uniqueness constraints can't see "still active."
+See [§4](#4-schema-decisions-why-its-shaped-this-way).
 
 **Q: What happens if the payment step throws an exception (not just
 returns FAILED)?**
@@ -582,10 +615,10 @@ already-closed transaction; the seat stays `LOCKED` and will be cleaned
 up by the timeout job like any other abandoned confirmation attempt.
 
 **Q: How would you scale this to handle a real airline's traffic?**
-Out of scope for this project by design (see §1), but the honest
-answer: read-heavy endpoints (search, seat availability) scale
-horizontally trivially since they're plain reads; the write path (seat
-locking) is bounded by row-lock contention on whatever seat is
+Out of scope for this project by design (see [§1](#1-why-this-project-exists)),
+but the honest answer: read-heavy endpoints (search, seat availability)
+scale horizontally trivially since they're plain reads; the write path
+(seat locking) is bounded by row-lock contention on whatever seat is
 currently "hot," which for a single seat is inherently serial no matter
 what — the real lever is keeping the locked critical section (between
 `FOR UPDATE` and `COMMIT`) as short as possible, which is why payment
