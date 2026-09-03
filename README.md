@@ -10,36 +10,10 @@ transactions and row-level pessimistic locking (`SELECT ... FOR UPDATE`).
 No Redis, no queues, no microservices — on purpose. The whole point of
 the project is to be interview-defensible: every line can be explained.
 
-A minimal React client lives in [`frontend/`](frontend/README.md) purely
-as a demo surface over this API — it holds no business logic of its own.
-Everything in this document describes the backend, which is the actual
-subject of the project.
-
-### At a glance
-
-| | |
-|---|---|
-| **Core guarantee** | Exactly one booking wins a contested seat, proven under real concurrent load |
-| **Mechanism** | Row-level pessimistic locking (`SELECT ... FOR UPDATE`) inside explicit transactions |
-| **Isolation level** | PostgreSQL default `READ COMMITTED` — correctness comes from the row lock, not snapshot isolation |
-| **Tested** | `tests/api-smoke-test.js` (15/15 assertions) · `tests/concurrency-test.js` at 5/10/20 concurrent requesters, exactly 1 success every time |
-| **Deliberately out of scope** | Auth/JWT, optimistic locking, real payment gateway, caching, horizontal scaling (see [§1](#1-why-this-project-exists)) |
-
----
-
-## Contents
-
-1. [Why this project exists](#1-why-this-project-exists)
-2. [Architecture](#2-architecture)
-3. [ER diagram](#3-er-diagram)
-4. [Schema decisions](#4-schema-decisions-why-its-shaped-this-way)
-5. [Booking / transaction flow](#5-booking--transaction-flow)
-6. [Concurrency: how "exactly one succeeds" is guaranteed](#6-concurrency-how-exactly-one-booking-succeeds-is-actually-guaranteed)
-7. [What was actually tested](#7-what-was-actually-tested-before-packaging)
-8. [Setup instructions](#8-setup-instructions)
-9. [Project structure](#9-project-structure)
-10. [Interview questions this project should be able to answer](#10-interview-questions-this-project-should-be-able-to-answer)
-11. [Environment variables](#11-environment-variables-env)
+A minimal React client lives in `frontend/` purely as a demo surface over
+this API — it holds no business logic of its own (see `frontend/README.md`).
+Everything in this document still describes the backend, which is the
+actual subject of the project.
 
 ---
 
@@ -72,8 +46,10 @@ integration, caching layer, horizontal scaling.
 
 ## 2. Architecture
 
+![Request flow diagram](docs/diagrams/architecture.svg)
+
 ```
-Client (curl / Postman / test scripts / frontend/)
+Client (curl / Postman / test scripts)
         │  HTTP (JSON)
         ▼
 Express routes  →  Controllers  →  Services  →  pg Pool  →  PostgreSQL
@@ -101,25 +77,7 @@ the project, not add value.
 
 ## 3. ER diagram
 
-```
-passenger ───┐
-             │ 1
-             │
-             │ N
-          booking ─────────────┐
-             │ 1                │ 1
-             │                  │
-             │ N                │ 1
-       booking_seat        payment
-             │ N
-             │
-             │ 1
-        flight_seat ───────── seat
-             │ N                (seat_number, seat_class)
-             │
-             │ 1
-          flight
-```
+![Entity relationship diagram](docs/diagrams/er-diagram.svg)
 
 - `passenger (1) ──< booking (N)`
 - `flight (1) ──< booking (N)`
@@ -132,7 +90,8 @@ passenger ───┐
 - `booking (1) ── payment (0/1)` — one payment attempt record per booking
   (a `UNIQUE` FK).
 
-Mermaid version (renders on GitHub):
+<details>
+<summary>Mermaid source (renders natively on GitHub, kept for diffability)</summary>
 
 ```mermaid
 erDiagram
@@ -194,6 +153,8 @@ erDiagram
     }
 ```
 
+</details>
+
 ---
 
 ## 4. Schema decisions (why it's shaped this way)
@@ -227,7 +188,7 @@ erDiagram
   invariant that actually matters — *at most one active claim on a seat
   at a time* — is enforced by the `flight_seat.status` state machine
   under a row lock, not by a static schema constraint. (This is a good
-  interview question — see [§10](#10-interview-questions-this-project-should-be-able-to-answer).)
+  interview question, see §8.)
 
 - **`CHECK` constraints do real validation at the DB level**, not just
   in application code: `source <> destination`, `arrival_time >
@@ -320,6 +281,8 @@ transaction, releases any `flight_seat` still `LOCKED` past
 
 ### 6.1 The mechanism
 
+![Concurrency sequence diagram](docs/diagrams/concurrency-sequence.svg)
+
 `SELECT ... FOR UPDATE` acquires an exclusive row-level lock on the
 matched `flight_seat` row(s) for the duration of the transaction. If a
 second transaction runs the same `SELECT ... FOR UPDATE` against the
@@ -367,9 +330,8 @@ correctness relies on explicit row locks (`FOR UPDATE`), not on
 snapshot isolation — `FOR UPDATE` makes each transaction re-check the
 row's latest committed state after the lock is granted, which is
 exactly the guarantee needed. (A pure optimistic/`SERIALIZABLE`
-approach would be a different, equally valid design — see
-[§10](#10-interview-questions-this-project-should-be-able-to-answer)
-for the trade-off discussion.)
+approach would be a different, equally valid design — see §8 for the
+trade-off discussion.)
 
 ### 6.5 Proof: the concurrency test
 
@@ -392,8 +354,7 @@ PASS: exactly one passenger won the seat; all others were correctly rejected.
 ```
 
 Tested at 5, 10, and 20 simultaneous requesters — result is always
-exactly 1 success. **This is the artifact to show in an interview** —
-or, live, the Concurrency test tab in `frontend/`.
+exactly 1 success. This is the artifact to show in an interview.
 
 ---
 
@@ -421,15 +382,32 @@ instance, from a freshly reset schema, not just reasoned about:
   `AVAILABLE` and its `PENDING` booking flipped to `FAILED`.
 - All four analytics queries in `sql/04_analytics_queries.sql` run
   without error against both an empty and a populated database.
+- `frontend/` was click-tested end-to-end against the live API with a
+  headless browser (search → seat map → lock → confirm → cancel →
+  history → concurrency test → analytics), not just built and assumed
+  to work — see the screenshots in **Demo**.
 
-A bug was actually caught and fixed during this process: `confirmBooking`
-and `cancelBooking` were reading the post-update booking state back
-through the shared connection pool (`pool.query`) instead of the open
-transaction's own client (`client.query`) — since the transaction hadn't
-committed yet, that read a different, uncommitted-invisible connection
-and silently returned stale pre-update data. Fixed by threading the
-transaction's `client` through to the read (`getBookingById(bookingId,
-client)`).
+Two bugs were actually caught and fixed during this process, not just
+theorized about:
+
+1. `confirmBooking` and `cancelBooking` were reading the post-update
+   booking state back through the shared connection pool (`pool.query`)
+   instead of the open transaction's own client (`client.query`) —
+   since the transaction hadn't committed yet, that read a different,
+   uncommitted-invisible connection and silently returned stale
+   pre-update data. Fixed by threading the transaction's `client`
+   through to the read (`getBookingById(bookingId, client)`).
+2. The API isn't fully uniform in how it shapes a booking's seat list:
+   `POST /api/bookings/lock` returns `seats: [{seat_number, price}]`,
+   while confirm/cancel/history all read from `v_booking_summary`,
+   which returns `seat_numbers: ["3A", "3B"]` — plain strings, no price.
+   The frontend originally assumed one shape everywhere and silently
+   showed a blank seat list after confirming. Caught by actually running
+   the flow end-to-end, not by reading the code. Also worth knowing:
+   `v_booking_summary` never joins `payment`, so no endpoint currently
+   returns payment status — the frontend's payment display was removed
+   rather than shipped showing nothing, but exposing it would be a
+   reasonable small addition to the view if you want it.
 
 ---
 
@@ -494,8 +472,7 @@ npm run dev
 ```
 
 Requires the backend from step 7 to already be running. Details in
-[`frontend/README.md`](frontend/README.md) — the Concurrency test tab
-fires real simultaneous requests at the live server, no simulation.
+`frontend/README.md`.
 
 ### Quick manual API tour
 
@@ -542,7 +519,7 @@ airline-reservation-system/
 ├── scripts/
 │   ├── seed.js
 │   └── reset-db.sh
-├── frontend/                      React/Vite demo client (see frontend/README.md)
+├── frontend/                     minimal React/Vite demo client (see frontend/README.md)
 ├── .env.example
 └── README.md
 ```
@@ -582,8 +559,7 @@ theory"?**
 `tests/concurrency-test.js` fires real concurrent HTTP requests (not a
 single-threaded simulation) at the same seat and asserts exactly one
 `201` and the rest `409`. Run at 5/10/20 concurrent requesters with
-consistent results — see [§6.5](#65-proof-the-concurrency-test) and
-[§7](#7-what-was-actually-tested-before-packaging).
+consistent results — see §6.5 and §7.
 
 **Q: Why is `flight_seat` a separate table from `seat`?**
 Because status and price are per-flight, not per-seat-globally — seat
