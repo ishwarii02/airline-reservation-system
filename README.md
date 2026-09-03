@@ -37,9 +37,10 @@ subject of the project.
 6. [Concurrency: how "exactly one succeeds" is guaranteed](#6-concurrency-how-exactly-one-booking-succeeds-is-actually-guaranteed)
 7. [What was actually tested](#7-what-was-actually-tested-before-packaging)
 8. [Setup instructions](#8-setup-instructions)
-9. [Project structure](#9-project-structure)
-10. [Interview questions this project should be able to answer](#10-interview-questions-this-project-should-be-able-to-answer)
-11. [Environment variables](#11-environment-variables-env)
+9. [Screenshots & demo](#9-screenshots--demo)
+10. [Project structure](#10-project-structure)
+11. [Interview questions this project should be able to answer](#11-interview-questions-this-project-should-be-able-to-answer)
+12. [Environment variables](#12-environment-variables-env)
 
 ---
 
@@ -96,6 +97,8 @@ Express routes  →  Controllers  →  Services  →  pg Pool  →  PostgreSQL
 There is no separate "repository" layer — for a project this size, an
 extra abstraction over `pg` would hide the SQL that is the whole point of
 the project, not add value.
+
+![Architecture diagram showing 5-layer request flow](assets/screenshots/01-architecture.svg)
 
 ---
 
@@ -194,6 +197,8 @@ erDiagram
     }
 ```
 
+![ER diagram visual representation](assets/screenshots/03-er-diagram.svg)
+
 ---
 
 ## 4. Schema decisions (why it's shaped this way)
@@ -227,7 +232,7 @@ erDiagram
   invariant that actually matters — *at most one active claim on a seat
   at a time* — is enforced by the `flight_seat.status` state machine
   under a row lock, not by a static schema constraint. (This is a good
-  interview question — see [§10](#10-interview-questions-this-project-should-be-able-to-answer).)
+  interview question — see [§11](#11-interview-questions-this-project-should-be-able-to-answer).)
 
 - **`CHECK` constraints do real validation at the DB level**, not just
   in application code: `source <> destination`, `arrival_time >
@@ -368,7 +373,7 @@ snapshot isolation — `FOR UPDATE` makes each transaction re-check the
 row's latest committed state after the lock is granted, which is
 exactly the guarantee needed. (A pure optimistic/`SERIALIZABLE`
 approach would be a different, equally valid design — see
-[§10](#10-interview-questions-this-project-should-be-able-to-answer)
+[§11](#11-interview-questions-this-project-should-be-able-to-answer)
 for the trade-off discussion.)
 
 ### 6.5 Proof: the concurrency test
@@ -394,6 +399,8 @@ PASS: exactly one passenger won the seat; all others were correctly rejected.
 Tested at 5, 10, and 20 simultaneous requesters — result is always
 exactly 1 success. **This is the artifact to show in an interview** —
 or, live, the Concurrency test tab in `frontend/`.
+
+![Concurrency sequence diagram - two passengers racing for one seat](assets/screenshots/02-concurrency-sequence.svg)
 
 ---
 
@@ -514,7 +521,73 @@ curl "http://localhost:3000/api/analytics/revenue"
 
 ---
 
-## 9. Project structure
+## 9. Screenshots & demo
+
+### System architecture (request flow)
+Every HTTP request flows through 5 layers: Client → Routes → Controllers → Services → PostgreSQL. The critical difference: **only the Services layer sees transactions and SQL locks.** Routes and controllers have zero awareness of concurrency or the database.
+
+![Architecture diagram showing 5-layer request flow](assets/screenshots/01-architecture.svg)
+
+---
+
+### Flight search and seat map
+
+The frontend provides a minimal UI for the full booking lifecycle. Start by searching flights, then select seats on an interactive seat map.
+
+| Search flights | Seat map view |
+|---|---|
+| ![Flight search](assets/screenshots/04-frontend-flight-search.png) | ![Seat map](assets/screenshots/05-frontend-seat-map.png) |
+
+---
+
+### Booking workflow
+
+Select seats, lock them (which triggers `SELECT ... FOR UPDATE` on the backend), then confirm with a simulated payment.
+
+| Seat selection | Booking confirmation |
+|---|---|
+| ![Seat selection with 1A, 1B selected](assets/screenshots/06-frontend-seat-selection.png) | ![Booking confirmation dialog showing payment options](assets/screenshots/07-frontend-booking-confirmation.png) |
+
+---
+
+### Booking history
+
+Track all past bookings for a passenger, with the ability to cancel confirmed bookings.
+
+![Booking history showing one confirmed booking on AI101 for seats 1A, 1B](assets/screenshots/08-frontend-booking-history.png)
+
+---
+
+### **The main demo: Concurrency test — exactly one winner**
+
+This is the proof that the pessimistic locking works. Fire 10 real simultaneous HTTP requests at the same seat from 10 different passengers:
+
+- **Expected:** 1 passes (201 Created), 9 fail (409 Conflict)
+- **Result:** Always exactly 1 winner, every time, under load
+
+The browser sends real `POST /api/bookings/lock` requests in parallel. The backend's `SELECT ... FOR UPDATE` ensures only the first to acquire the database-level row lock can proceed. The second and subsequent transactions wait for the lock, then re-read the now-`LOCKED` seat and reject with a 409.
+
+![Concurrency test results showing 1 WON, 9 LOST, and the table of results with passenger #1 getting booking_id=2 while all others got 409](assets/screenshots/09-frontend-concurrency-test.png)
+
+---
+
+### How two passengers race for one seat (under the hood)
+
+This sequence diagram shows what actually happens when two passengers try to book the same seat milliseconds apart. Request A locks the row first, updates it, commits. Request B's `SELECT ... FOR UPDATE` then blocks, waiting for A's lock. When A commits, B unblocks, re-reads the now-`LOCKED` seat, and correctly rejects.
+
+![Concurrency sequence diagram showing t=0ms Request A begins and locks, t≈3ms Request B begins but blocks, t≈28ms A continues and updates to LOCKED, t≈29ms B unblocks and sees LOCKED, then both commit/rollback](assets/screenshots/02-concurrency-sequence.svg)
+
+---
+
+### Analytics dashboard
+
+View occupancy rates per flight and confirmed revenue.
+
+![Analytics page showing occupancy table (AI101: 2/28 = 7.14%) and revenue table (AI101: ₹19800.00)](assets/screenshots/10-frontend-analytics.png)
+
+---
+
+## 10. Project structure
 
 ```
 airline-reservation-system/
@@ -543,13 +616,15 @@ airline-reservation-system/
 │   ├── seed.js
 │   └── reset-db.sh
 ├── frontend/                      React/Vite demo client (see frontend/README.md)
+├── assets/
+│   └── screenshots/               diagrams and UI screenshots
 ├── .env.example
 └── README.md
 ```
 
 ---
 
-## 10. Interview questions this project should be able to answer
+## 11. Interview questions this project should be able to answer
 
 **Q: What actually prevents a double-booking?**
 `SELECT ... FOR UPDATE` inside a transaction on the `flight_seat` row.
@@ -642,7 +717,7 @@ mechanism this project exists to demonstrate.
 
 ---
 
-## 11. Environment variables (`.env`)
+## 12. Environment variables (`.env`)
 
 | Variable | Default | Meaning |
 |---|---|---|
