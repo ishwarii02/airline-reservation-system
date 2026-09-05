@@ -7,24 +7,28 @@ transactions and row-level pessimistic locking (`SELECT ... FOR UPDATE`).
 
 **Stack:** Node.js · Express.js · PostgreSQL (raw SQL via `pg`, no ORM)
 
-No Redis, no queues, no microservices — on purpose. The whole point of
-the project is to be interview-defensible: every line can be explained.
+No Redis, no queues, or microservices are used. The project focuses on a
+clear design centered around database transactions and concurrency control.
 
 A minimal React client lives in `frontend/` purely as a demo surface over
 this API — it holds no business logic of its own (see `frontend/README.md`).
-Everything in this document still describes the backend, which is the
-actual subject of the project.
+Everything in this document describes the backend, which contains the
+core booking, transaction, and concurrency logic.
 
 ---
 
 ## 1. Why this project exists
 
-Booking a seat is a classic "two users read the same row, both think it's
-free, both write" race condition. This project's entire design revolves
-around solving that one problem correctly and being able to prove it —
-not around adding features.
+Booking a seat is a classic concurrency problem: two users may read the
+same row, both see the seat as available, and both attempt to update it.
+Without proper synchronization, this can result in conflicting bookings.
+
+This project's design focuses on solving that problem correctly using
+PostgreSQL transactions and row-level locking while supporting the
+complete booking lifecycle.
 
 **What's implemented:**
+
 - Flight search
 - Seat availability per flight
 - Temporary seat locking when a booking starts (`PENDING`)
@@ -32,15 +36,23 @@ not around adding features.
 - Automatic rollback / seat release on payment failure or lock timeout
 - Cancellation (releases the seat again)
 - Booking history per passenger
-- A reproducible concurrency test: N simultaneous requests for the same
-  seat, exactly 1 succeeds
-- A handful of SQL analytics queries (occupancy, revenue)
+- A reproducible concurrency test with simultaneous requests for the same
+  seat
+- SQL analytics queries for occupancy and revenue
 
-**What's deliberately not implemented** (out of scope, listed so it's
-clear this was a decision, not an oversight): optimistic locking /
-version-column comparison, deadlock experiments, authentication/JWT,
-seat maps per aircraft type, multi-currency, real payment gateway
-integration, caching layer, horizontal scaling.
+**Out of scope:**
+
+- Optimistic locking / version-column comparison
+- Authentication/JWT
+- Seat maps per aircraft type
+- Multi-currency
+- Real payment gateway integration
+- Caching layer
+- Message queues
+- Horizontal scaling
+
+These features are outside the current scope so the project can remain
+focused on the core booking workflow and database concurrency handling.
 
 ---
 
@@ -48,7 +60,7 @@ integration, caching layer, horizontal scaling.
 
 ![Request flow diagram](docs/diagrams/architecture.svg)
 
-```
+```text
 Client (curl / Postman / test scripts)
         │  HTTP (JSON)
         ▼
@@ -57,21 +69,22 @@ Express routes  →  Controllers  →  Services  →  pg Pool  →  PostgreSQL
                                       + transactions live here)
 ```
 
-- **`routes/`** just wire an HTTP verb + path to a controller function.
-- **`controllers/`** parse the request, call a service, shape the response.
-  No SQL, no transaction logic here.
-- **`services/booking.service.js`** is where everything that matters
-  happens: every multi-statement operation is wrapped in a single
-  PostgreSQL transaction via `withTransaction()` in `src/db/pool.js`.
+- **`routes/`** wire an HTTP verb and path to a controller function.
+- **`controllers/`** parse the request, call a service, and shape the
+  response. No SQL or transaction logic is placed here.
+- **`services/booking.service.js`** contains the main booking logic.
+  Every multi-statement operation is wrapped in a single PostgreSQL
+  transaction via `withTransaction()` in `src/db/pool.js`.
 - **`services/payment.service.js`** simulates an external payment gateway
-  (random ~90% success by default, or a forced outcome for tests/demos).
-- **`services/lock-cleanup.service.js`** is a background job (`setInterval`,
-  also callable via an endpoint) that releases seats whose lock has
-  outlived `SEAT_LOCK_TIMEOUT_MINUTES` without being confirmed.
+  with random ~90% success by default, or a forced outcome for tests.
+- **`services/lock-cleanup.service.js`** is a background job
+  (`setInterval`, also callable through an endpoint) that releases seats
+  whose lock has outlived `SEAT_LOCK_TIMEOUT_MINUTES` without being
+  confirmed.
 
-There is no separate "repository" layer — for a project this size, an
-extra abstraction over `pg` would hide the SQL that is the whole point of
-the project, not add value.
+There is no separate repository layer. For a project of this size,
+keeping SQL close to the service layer makes the database operations and
+transaction flow easier to follow.
 
 ---
 
@@ -83,15 +96,15 @@ the project, not add value.
 - `flight (1) ──< booking (N)`
 - `flight (1) ──< flight_seat (N)`, `seat (1) ──< flight_seat (N)` —
   `flight_seat` is the associative entity that gives a physical `seat` an
-  inventory row (status, price) *per flight*.
+  inventory row containing status and price for each flight.
 - `booking (1) ──< booking_seat (N)`, `flight_seat (1) ──< booking_seat (N)`
-  — `booking_seat` is the associative entity linking a booking to the
-  specific `flight_seat` row(s) it reserved.
-- `booking (1) ── payment (0/1)` — one payment attempt record per booking
-  (a `UNIQUE` FK).
+  — `booking_seat` links a booking to the specific `flight_seat` rows it
+  reserved.
+- `booking (1) ── payment (0/1)` — one payment record per booking through
+  a `UNIQUE` foreign key.
 
 <details>
-<summary>Mermaid source (renders natively on GitHub, kept for diffability)</summary>
+<summary>Mermaid source</summary>
 
 ```mermaid
 erDiagram
@@ -109,6 +122,7 @@ erDiagram
         varchar email UK
         varchar phone
     }
+
     FLIGHT {
         int flight_id PK
         varchar flight_number
@@ -118,11 +132,13 @@ erDiagram
         timestamptz arrival_time
         numeric base_price
     }
+
     SEAT {
         int seat_id PK
         varchar seat_number UK
         varchar seat_class
     }
+
     FLIGHT_SEAT {
         int flight_seat_id PK
         int flight_id FK
@@ -131,6 +147,7 @@ erDiagram
         numeric price
         timestamptz locked_at
     }
+
     BOOKING {
         int booking_id PK
         int passenger_id FK
@@ -138,12 +155,14 @@ erDiagram
         varchar booking_status
         numeric total_amount
     }
+
     BOOKING_SEAT {
         int booking_seat_id PK
         int booking_id FK
         int flight_seat_id FK
         numeric price_at_booking
     }
+
     PAYMENT {
         int payment_id PK
         int booking_id FK UK
@@ -157,51 +176,59 @@ erDiagram
 
 ---
 
-## 4. Schema decisions (why it's shaped this way)
+## 4. Schema decisions
 
-- **`seat` is separate from `flight_seat`.** `seat` is a reusable seat
-  map (seat number + class). `flight_seat` is the inventory row for that
-  seat *on one specific flight* — status and price are flight-specific
-  (business class costs more, and a seat that's booked on Monday's
-  flight is still available on Tuesday's). This is the normalization
-  decision that makes the whole schema 3NF: seat class doesn't repeat
-  per flight, price doesn't get stored redundantly on `seat`.
+- **`seat` is separate from `flight_seat`.** `seat` represents a reusable
+  seat map containing the seat number and class. `flight_seat` represents
+  the inventory of that seat for one specific flight, including its status
+  and price.
+
+  This allows the same seat layout to be reused across flights. A seat
+  booked on one flight remains independent from the same seat on another
+  flight.
 
 - **`flight_seat.status` (`AVAILABLE` / `LOCKED` / `BOOKED`) is the
-  single source of truth for "is this seat takeable right now."** It is
-  also the row every booking attempt locks with `FOR UPDATE`. Putting
-  the mutable, contended state on its own narrow row (rather than, say,
-  deriving availability by scanning `booking_seat`) is what makes
-  `SELECT ... FOR UPDATE` cheap and precise — one row per seat per
-  flight, locked directly.
+  primary source of truth for current seat availability.**
 
-- **`booking_seat.price_at_booking` snapshots the price.** If
-  `flight_seat.price` changes later (a fare change), historical bookings
-  and past revenue reports must not silently change. This is a standard
-  "snapshot mutable reference data at transaction time" pattern.
+  It is also the row locked during booking attempts using `FOR UPDATE`.
+  Keeping the mutable availability state on `flight_seat` allows each
+  booking request to directly lock the specific seat inventory row.
 
-- **No hard uniqueness constraint stopping a `flight_seat_id` from
-  appearing in two `booking_seat` rows.** This is intentional, not a
-  gap: a seat can legitimately be booked, cancelled, and booked again by
-  someone else — that's two valid `booking_seat` rows referencing the
-  same `flight_seat_id`, at different times, for different bookings. The
-  invariant that actually matters — *at most one active claim on a seat
-  at a time* — is enforced by the `flight_seat.status` state machine
-  under a row lock, not by a static schema constraint. (This is a good
-  interview question, see §8.)
+- **`booking_seat.price_at_booking` stores a price snapshot.**
 
-- **`CHECK` constraints do real validation at the DB level**, not just
-  in application code: `source <> destination`, `arrival_time >
-  departure_time`, positive prices/amounts, and enumerated status values
-  for `flight_seat.status`, `booking.booking_status`, `payment.status`,
-  `seat.seat_class`. Verified directly against the running DB (see
-  [§7](#7-what-was-actually-tested-before-packaging)).
+  If `flight_seat.price` changes later due to a fare update, historical
+  bookings and revenue reports should continue to use the original price
+  paid during booking.
 
-- **`payment` has a `UNIQUE` FK on `booking_id`.** One booking gets at
-  most one payment attempt recorded per confirmation call (a booking
-  that fails payment goes to `FAILED`, not back to `PENDING` for a
-  retry, to keep the state machine simple — a new booking/lock is
-  required to retry).
+- **A `flight_seat_id` can appear in multiple historical
+  `booking_seat` rows.**
+
+  A seat may be booked, cancelled, and booked again later by another
+  passenger. Multiple historical booking records referencing the same
+  `flight_seat_id` are therefore valid.
+
+  The important rule is that only one active booking can hold a seat at
+  a time. This is managed through the `flight_seat.status` state and
+  row-level locking.
+
+- **`CHECK` constraints provide database-level validation.**
+
+  Examples include:
+
+  - `source <> destination`
+  - `arrival_time > departure_time`
+  - Positive prices and payment amounts
+  - Valid values for `flight_seat.status`
+  - Valid values for `booking.booking_status`
+  - Valid values for `payment.status`
+  - Valid values for `seat.seat_class`
+
+- **`payment` has a `UNIQUE` foreign key on `booking_id`.**
+
+  Each booking has at most one payment record in the current design.
+
+  A booking that fails payment moves to `FAILED` and its seat is released.
+  A new booking can then be created for another payment attempt.
 
 ---
 
@@ -209,7 +236,7 @@ erDiagram
 
 ### 5.1 Lock a seat — `POST /api/bookings/lock`
 
-This is the operation the whole project is built around.
+The booking process begins by locking the requested seat rows.
 
 ```sql
 BEGIN;
@@ -217,131 +244,279 @@ BEGIN;
 SELECT fs.flight_seat_id, fs.status, fs.price, s.seat_number
 FROM flight_seat fs
 JOIN seat s ON s.seat_id = fs.seat_id
-WHERE fs.flight_id = $1 AND s.seat_number = ANY($2::text[])
-ORDER BY fs.flight_seat_id     -- stable lock order, see §6.3
-FOR UPDATE OF fs;              -- <-- row-level pessimistic lock
+WHERE fs.flight_id = $1
+  AND s.seat_number = ANY($2::text[])
+ORDER BY fs.flight_seat_id
+FOR UPDATE OF fs;
 
--- application checks: all requested seats exist? all AVAILABLE?
--- if not: throw -> outer code ROLLBACKs, locks released immediately
+-- application checks:
+-- all requested seats exist?
+-- all requested seats are AVAILABLE?
 
-UPDATE flight_seat SET status = 'LOCKED', locked_at = now()
+UPDATE flight_seat
+SET status = 'LOCKED',
+    locked_at = now()
 WHERE flight_seat_id = ANY($1::int[]);
 
-INSERT INTO booking (passenger_id, flight_id, booking_status, total_amount)
-VALUES ($1, $2, 'PENDING', $3) RETURNING booking_id;
+INSERT INTO booking (
+    passenger_id,
+    flight_id,
+    booking_status,
+    total_amount
+)
+VALUES ($1, $2, 'PENDING', $3)
+RETURNING booking_id;
 
-INSERT INTO booking_seat (booking_id, flight_seat_id, price_at_booking)
-VALUES (...);   -- one row per seat
+INSERT INTO booking_seat (
+    booking_id,
+    flight_seat_id,
+    price_at_booking
+)
+VALUES (...);
 
 COMMIT;
 ```
 
-If any step fails (seat already taken, seat doesn't exist, a constraint
-violation), the whole transaction is rolled back via `withTransaction()`
-in `src/db/pool.js` — no partial booking, no orphaned `LOCKED` seat.
+If any step fails, such as a requested seat being unavailable or a
+database constraint being violated, the entire transaction is rolled
+back through `withTransaction()` in `src/db/pool.js`.
+
+This prevents partial updates, such as a seat being locked without a
+corresponding booking.
 
 ### 5.2 Confirm a booking — `POST /api/bookings/:id/confirm`
 
 ```sql
 BEGIN;
-SELECT ... FROM booking WHERE booking_id = $1 FOR UPDATE;   -- must be PENDING
-SELECT ... FROM flight_seat ... FOR UPDATE OF fs;           -- re-lock its seats
+
+SELECT ...
+FROM booking
+WHERE booking_id = $1
+FOR UPDATE;
+
+SELECT ...
+FROM flight_seat
+...
+FOR UPDATE OF fs;
+
 -- call simulated payment gateway
+
 INSERT INTO payment (...);
--- on SUCCESS: flight_seat -> BOOKED, booking -> CONFIRMED
--- on FAILED : flight_seat -> AVAILABLE, booking -> FAILED
+
+-- on SUCCESS:
+-- flight_seat -> BOOKED
+-- booking -> CONFIRMED
+
+-- on FAILED:
+-- flight_seat -> AVAILABLE
+-- booking -> FAILED
+
 COMMIT;
 ```
 
-The payment call happens *inside* the transaction, and the resulting
-booking/seat state change commits in the **same** transaction as the
-payment record. That is what guarantees the system can never end up
-"charged but not booked" or "booked but not charged" — both halves
-commit together or neither does.
+The payment result and booking updates are processed within the same
+transaction.
+
+On successful payment:
+
+```text
+flight_seat: LOCKED → BOOKED
+booking:     PENDING → CONFIRMED
+```
+
+On payment failure:
+
+```text
+flight_seat: LOCKED → AVAILABLE
+booking:     PENDING → FAILED
+```
+
+The payment record and the resulting booking and seat state changes are
+committed together as part of the same transaction.
 
 ### 5.3 Cancel a booking — `POST /api/bookings/:id/cancel`
 
-Locks the booking row and its seats, sets `flight_seat.status =
-'AVAILABLE'`, `booking.booking_status = 'CANCELLED'`, and marks any
-`SUCCESS` payment as `REFUNDED` (simulated — no real refund flow).
+The cancellation process locks the booking row and its associated seats.
+
+It then:
+
+- Sets `flight_seat.status` to `AVAILABLE`
+- Sets `booking.booking_status` to `CANCELLED`
+- Marks a successful payment as `REFUNDED`
+
+The refund process is simulated and does not connect to an external
+payment provider.
 
 ### 5.4 Expired lock cleanup
 
-A booking that's locked but never confirmed (user abandoned checkout)
-would otherwise hold a seat hostage forever. `lock-cleanup.service.js`
-runs every 60s (`startLockCleanupJob`, also triggerable via `POST
-/api/analytics/release-expired-locks` for demos) and, in one
-transaction, releases any `flight_seat` still `LOCKED` past
-`SEAT_LOCK_TIMEOUT_MINUTES` and marks its still-`PENDING` booking as
-`FAILED`.
+A user may lock a seat and leave the booking process without confirming
+or cancelling it.
+
+Without cleanup, the seat could remain locked indefinitely.
+
+`lock-cleanup.service.js` runs every 60 seconds using `setInterval`.
+It can also be triggered through:
+
+```text
+POST /api/analytics/release-expired-locks
+```
+
+The cleanup process runs inside a transaction and:
+
+1. Finds seats that remain `LOCKED` beyond
+   `SEAT_LOCK_TIMEOUT_MINUTES`.
+2. Releases those seats by setting their status to `AVAILABLE`.
+3. Marks the associated `PENDING` booking as `FAILED`.
 
 ---
 
-## 6. Concurrency: how "exactly one booking succeeds" is actually guaranteed
+## 6. Concurrency control
 
-### 6.1 The mechanism
+### 6.1 Row-level locking
 
 ![Concurrency sequence diagram](docs/diagrams/concurrency-sequence.svg)
 
 `SELECT ... FOR UPDATE` acquires an exclusive row-level lock on the
-matched `flight_seat` row(s) for the duration of the transaction. If a
-second transaction runs the same `SELECT ... FOR UPDATE` against the
-same row before the first commits, **PostgreSQL blocks the second
-transaction's statement** until the first transaction ends (COMMIT or
-ROLLBACK). This is not application-level locking (a mutex, a Redis
-lock) — it is the database itself serializing access to that row.
+matched `flight_seat` row or rows for the duration of the transaction.
 
-When the second transaction is unblocked, it re-reads the row as it now
-exists — which reflects whatever the first transaction just committed
-(`status = 'LOCKED'`), not a stale snapshot from before it started
-waiting. So the second transaction correctly sees the seat is no longer
-`AVAILABLE` and rejects the booking with `409 Seat Unavailable`.
+If another transaction attempts to execute `SELECT ... FOR UPDATE` on the
+same row before the first transaction completes, PostgreSQL waits until
+the first transaction commits or rolls back.
 
-### 6.2 Why not just check-then-update without a lock?
+The database therefore serializes access to the contested seat row.
 
-```sql
-SELECT status FROM flight_seat WHERE flight_seat_id = 5;   -- sees AVAILABLE
--- (another transaction interleaves here and books the seat)
-UPDATE flight_seat SET status = 'LOCKED' WHERE flight_seat_id = 5;  -- succeeds anyway!
+After the waiting transaction obtains the lock, it observes the latest
+committed state of the row.
+
+For example:
+
+```text
+Initial state:
+
+Seat 3A → AVAILABLE
 ```
 
-Without `FOR UPDATE`, both transactions can read `AVAILABLE`
-simultaneously and both proceed to `UPDATE` — a classic lost-update /
-double-booking race. `FOR UPDATE` closes exactly this window by making
-the second reader *wait* instead of reading a stale value.
+Two users request the same seat:
 
-### 6.3 Avoiding deadlocks on multi-seat bookings
+```text
+User A ────┐
+           ├── Request Seat 3A
+User B ────┘
+```
 
-If passenger A books seats `[1A, 1B]` and passenger B concurrently books
-`[1B, 1A]` (same two seats, opposite order), naive locking could deadlock:
-A holds 1A and waits for 1B while B holds 1B and waits for 1A. The fix
-used here is `ORDER BY fs.flight_seat_id` in the locking `SELECT` —
-every transaction always acquires locks in the same global order (by
-primary key), so this specific deadlock pattern can't occur. Verified
-manually (see [§7](#7-what-was-actually-tested-before-packaging)) with
-two transactions requesting the same two seats in reversed order — no
-deadlock, one wins cleanly with the other rejected.
+The first transaction locks the seat:
+
+```text
+User A → Seat 3A → LOCKED
+```
+
+When the second transaction continues, it observes:
+
+```text
+Seat 3A → LOCKED
+```
+
+Since the seat is no longer `AVAILABLE`, the request is rejected with:
+
+```text
+409 Seat Unavailable
+```
+
+### 6.2 Why a simple check-then-update is unsafe
+
+Consider:
+
+```sql
+SELECT status
+FROM flight_seat
+WHERE flight_seat_id = 5;
+
+-- sees AVAILABLE
+
+UPDATE flight_seat
+SET status = 'LOCKED'
+WHERE flight_seat_id = 5;
+```
+
+Without row-level locking, two transactions can both read the seat status
+as `AVAILABLE` before either transaction performs the update.
+
+Both requests may then attempt to update the same seat.
+
+This creates a race condition.
+
+Using:
+
+```sql
+SELECT ... FOR UPDATE
+```
+
+ensures that the second transaction waits while another transaction is
+currently working with the same seat row.
+
+### 6.3 Stable lock ordering for multi-seat bookings
+
+A booking may contain multiple seats.
+
+For example:
+
+```text
+Passenger A: [1A, 1B]
+
+Passenger B: [1B, 1A]
+```
+
+If transactions request locks in different orders, overlapping requests
+can increase the risk of deadlocks.
+
+To keep the locking order consistent, the query uses:
+
+```sql
+ORDER BY fs.flight_seat_id
+```
+
+This causes transactions to acquire seat locks in the same order based
+on the `flight_seat_id`.
 
 ### 6.4 Isolation level
 
-The app uses PostgreSQL's default `READ COMMITTED` isolation level.
-`READ COMMITTED` is sufficient here specifically *because* the
-correctness relies on explicit row locks (`FOR UPDATE`), not on
-snapshot isolation — `FOR UPDATE` makes each transaction re-check the
-row's latest committed state after the lock is granted, which is
-exactly the guarantee needed. (A pure optimistic/`SERIALIZABLE`
-approach would be a different, equally valid design — see §8 for the
-trade-off discussion.)
+The application uses PostgreSQL's default:
 
-### 6.5 Proof: the concurrency test
-
-`tests/concurrency-test.js` spins up N passengers and fires N truly
-simultaneous `POST /api/bookings/lock` requests at the same seat via
-`Promise.all`. Run against a clean seed:
-
+```text
+READ COMMITTED
 ```
-$ node tests/concurrency-test.js 1 6C 20
 
+isolation level.
+
+The booking workflow relies on explicit row-level locking through:
+
+```sql
+SELECT ... FOR UPDATE
+```
+
+This ensures that concurrent transactions accessing the same seat do not
+perform conflicting updates simultaneously.
+
+### 6.5 Concurrency test
+
+`tests/concurrency-test.js` creates multiple simultaneous booking
+requests for the same seat using:
+
+```javascript
+Promise.all(...)
+```
+
+Example:
+
+```bash
+node tests/concurrency-test.js 1 6C 20
+```
+
+This creates 20 concurrent booking requests for seat `6C` on flight `1`.
+
+Example result:
+
+```text
 Result | Passenger | HTTP | Latency | Detail
 -------|-----------|------|---------|-------
 LOST   | 7         | 409  |    68ms | Seat(s) already taken: 6C
@@ -350,117 +525,218 @@ LOST   | 20        | 409  |    72ms | Seat(s) already taken: 6C
 ...(17 more LOST)...
 
 Succeeded: 1  Conflicted(409): 19  Other: 0
-PASS: exactly one passenger won the seat; all others were correctly rejected.
+PASS: exactly one passenger successfully locked the seat.
 ```
 
-Tested at 5, 10, and 20 simultaneous requesters — result is always
-exactly 1 success. This is the artifact to show in an interview.
+The test was run with:
+
+- 5 simultaneous requests
+- 10 simultaneous requests
+- 20 simultaneous requests
+
+Each run resulted in one successful request while the remaining requests
+were rejected because the seat was no longer available.
 
 ---
 
-## 7. What was actually tested before packaging
+## 7. Testing
 
-All of the following were run against a real local PostgreSQL 16
-instance, from a freshly reset schema, not just reasoned about:
+The following tests were run against a local PostgreSQL instance using a
+freshly initialized schema.
 
-- `tests/api-smoke-test.js` — full lifecycle (search → seat availability
-  → lock → double-lock rejected → confirm w/ forced payment SUCCESS →
-  seat BOOKED → booking history → cancel → seat AVAILABLE again → lock →
-  confirm w/ forced payment FAILURE → seat released → analytics
-  endpoints respond). **15/15 assertions pass.**
-- `tests/concurrency-test.js` — run at 5, 10, and 20 concurrent
-  requesters against the same seat. Exactly 1 success every time.
-- Manual deadlock check: two overlapping multi-seat bookings requesting
-  the same two seats in reverse order, fired concurrently — no deadlock,
-  resolved in single-digit milliseconds, one winner.
-- Manual constraint checks against the live DB: duplicate email
-  rejected (`UNIQUE`), `source = destination` rejected (`CHECK`),
-  invalid `seat_class` rejected (`CHECK`), negative price rejected
-  (`CHECK`).
-- Lock-cleanup job: manually aged a `LOCKED` seat's `locked_at` past the
-  timeout, called the cleanup endpoint, confirmed the seat returned to
-  `AVAILABLE` and its `PENDING` booking flipped to `FAILED`.
-- All four analytics queries in `sql/04_analytics_queries.sql` run
-  without error against both an empty and a populated database.
-- `frontend/` was click-tested end-to-end against the live API with a
-  headless browser (search → seat map → lock → confirm → cancel →
-  history → concurrency test → analytics), not just built and assumed
-  to work — see the screenshots in **Demo**.
+- `tests/api-smoke-test.js` — full lifecycle:
 
-Two bugs were actually caught and fixed during this process, not just
-theorized about:
+  ```text
+  search
+  → seat availability
+  → lock
+  → duplicate lock rejected
+  → confirm with forced payment SUCCESS
+  → seat BOOKED
+  → booking history
+  → cancel
+  → seat AVAILABLE again
+  → lock
+  → confirm with forced payment FAILURE
+  → seat released
+  → analytics endpoints
+  ```
 
-1. `confirmBooking` and `cancelBooking` were reading the post-update
-   booking state back through the shared connection pool (`pool.query`)
-   instead of the open transaction's own client (`client.query`) —
-   since the transaction hadn't committed yet, that read a different,
-   uncommitted-invisible connection and silently returned stale
-   pre-update data. Fixed by threading the transaction's `client`
-   through to the read (`getBookingById(bookingId, client)`).
-2. The API isn't fully uniform in how it shapes a booking's seat list:
-   `POST /api/bookings/lock` returns `seats: [{seat_number, price}]`,
-   while confirm/cancel/history all read from `v_booking_summary`,
-   which returns `seat_numbers: ["3A", "3B"]` — plain strings, no price.
-   The frontend originally assumed one shape everywhere and silently
-   showed a blank seat list after confirming. Caught by actually running
-   the flow end-to-end, not by reading the code. Also worth knowing:
-   `v_booking_summary` never joins `payment`, so no endpoint currently
-   returns payment status — the frontend's payment display was removed
-   rather than shipped showing nothing, but exposing it would be a
-   reasonable small addition to the view if you want it.
+  **15/15 assertions pass.**
+
+- `tests/concurrency-test.js` — executed with 5, 10, and 20 concurrent
+  requests targeting the same seat. Each run resulted in exactly one
+  successful request.
+
+- Multi-seat concurrency testing — overlapping multi-seat requests were
+  tested with the same seats requested in reversed order. The requests
+  completed without a deadlock, with one request succeeding and the other
+  being rejected based on seat availability.
+
+- Database constraint testing:
+
+  - Duplicate email rejected (`UNIQUE`)
+  - `source = destination` rejected (`CHECK`)
+  - Invalid `seat_class` rejected (`CHECK`)
+  - Negative price rejected (`CHECK`)
+
+- Lock-cleanup testing — a `LOCKED` seat's `locked_at` timestamp was
+  manually set beyond the configured timeout. The cleanup process was
+  triggered and the seat returned to `AVAILABLE` while its associated
+  `PENDING` booking changed to `FAILED`.
+
+- Analytics testing — all queries in
+  `sql/04_analytics_queries.sql` were executed successfully against both
+  an empty and a populated database.
+
+- `frontend/` was tested end-to-end against the live API:
+
+  ```text
+  search
+  → seat map
+  → lock
+  → confirm
+  → cancel
+  → history
+  → concurrency test
+  → analytics
+  ```
+
+### Issues identified during testing
+
+Two implementation issues were found and fixed during testing.
+
+#### 1. Transaction client usage
+
+`confirmBooking` and `cancelBooking` initially read the updated booking
+state through the shared connection pool:
+
+```javascript
+pool.query(...)
+```
+
+instead of the active transaction client:
+
+```javascript
+client.query(...)
+```
+
+Since the transaction had not yet committed, a query executed through a
+different pooled connection could not see the uncommitted changes.
+
+The issue was fixed by passing the active transaction client to the read:
+
+```javascript
+getBookingById(bookingId, client)
+```
+
+#### 2. Booking seat response shape
+
+The API uses different seat response shapes in different endpoints.
+
+`POST /api/bookings/lock` returns:
+
+```javascript
+seats: [
+  {
+    seat_number,
+    price
+  }
+]
+```
+
+while confirm, cancel, and history endpoints read from
+`v_booking_summary` and return:
+
+```javascript
+seat_numbers: ["3A", "3B"]
+```
+
+The frontend initially assumed the same response structure everywhere,
+which caused the seat list to appear blank after confirmation.
+
+The frontend was updated to handle the returned structure correctly.
+
+`v_booking_summary` also does not join the `payment` table, so the current
+booking summary does not include payment status.
 
 ---
 
 ## 8. Setup instructions
 
 ### Prerequisites
-- Node.js 18+ (uses global `fetch` in the test scripts)
-- PostgreSQL 14+ running locally (or reachable) with a superuser you can
-  run `psql` as
 
-### Commands (copy-paste, in order)
+- Node.js 18+ (uses global `fetch` in the test scripts)
+- PostgreSQL 14+ running locally or reachable with a user that can run
+  `psql`
+
+### Commands
 
 ```bash
 # 1. Unzip and enter the project
 unzip airline-reservation-system.zip
 cd airline-reservation-system
 
-# 2. Create the DB role + database (run once, as a Postgres superuser)
+# 2. Create the DB role + database
 psql -U postgres -f sql/00_create_db.sql
 
 # 3. Configure the app
 cp .env.example .env
-# edit .env if your Postgres user/password/host differ from the defaults
+
+# Edit .env if your PostgreSQL configuration differs
 
 # 4. Apply schema + views/triggers
 export PGPASSWORD=airline_pass
-psql -h localhost -U airline_user -d airline_db -f sql/01_schema.sql
-psql -h localhost -U airline_user -d airline_db -f sql/02_constraints_indexes.sql
+
+psql -h localhost -U airline_user -d airline_db \
+  -f sql/01_schema.sql
+
+psql -h localhost -U airline_user -d airline_db \
+  -f sql/02_constraints_indexes.sql
 
 # 5. Install Node dependencies
 npm install
 
-# 6. Seed sample data (passengers, flights, seat map, inventory)
+# 6. Seed sample data
 npm run seed
 
 # 7. Start the API
 npm start
-# -> Airline reservation API listening on http://localhost:3000
+```
 
-# 8. In another terminal: run the end-to-end smoke test
+The API starts at:
+
+```text
+http://localhost:3000
+```
+
+### Run the smoke test
+
+In another terminal:
+
+```bash
 npm run test:api
+```
 
-# 9. Run the concurrency test (the main demo)
-#    args: flightId seatNumber numberOfConcurrentUsers
+### Run the concurrency test
+
+```bash
 node tests/concurrency-test.js 1 3A 10
+```
 
-# To re-run the concurrency test against the same seat again, reset first:
+Arguments:
+
+```text
+flightId seatNumber numberOfConcurrentUsers
+```
+
+To run the concurrency test again against the same seat:
+
+```bash
 ./scripts/reset-db.sh
 ```
 
-`scripts/reset-db.sh` re-applies the schema and seed in one shot — use
-it between concurrency test runs so you're always racing for a seat that
-starts `AVAILABLE`.
+The reset script re-applies the schema and seed data.
 
 ### 8a. Optional: run the demo frontend
 
@@ -468,24 +744,53 @@ starts `AVAILABLE`.
 cd frontend
 npm install
 npm run dev
-# -> http://localhost:5173
 ```
 
-Requires the backend from step 7 to already be running. Details in
-`frontend/README.md`.
+The frontend starts at:
+
+```text
+http://localhost:5173
+```
+
+The backend must already be running.
+
+See:
+
+```text
+frontend/README.md
+```
+
+for frontend-specific details.
 
 ### Quick manual API tour
 
 ```bash
+# Search flights
 curl "http://localhost:3000/api/flights?source=BOM&destination=DEL"
+
+# Get available seats
 curl "http://localhost:3000/api/flights/1/seats"
-curl -X POST localhost:3000/api/bookings/lock -H "Content-Type: application/json" \
+
+# Lock a seat
+curl -X POST localhost:3000/api/bookings/lock \
+  -H "Content-Type: application/json" \
   -d '{"passengerId":1,"flightId":1,"seatNumbers":["3A"]}'
-curl -X POST localhost:3000/api/bookings/1/confirm -H "Content-Type: application/json" \
+
+# Confirm booking
+curl -X POST localhost:3000/api/bookings/1/confirm \
+  -H "Content-Type: application/json" \
   -d '{"forcePaymentOutcome":"SUCCESS"}'
+
+# Cancel booking
 curl -X POST localhost:3000/api/bookings/1/cancel
+
+# Passenger booking history
 curl "http://localhost:3000/api/passengers/1/bookings"
+
+# Occupancy analytics
 curl "http://localhost:3000/api/analytics/occupancy"
+
+# Revenue analytics
 curl "http://localhost:3000/api/analytics/revenue"
 ```
 
@@ -493,139 +798,47 @@ curl "http://localhost:3000/api/analytics/revenue"
 
 ## 9. Project structure
 
-```
+```text
 airline-reservation-system/
-├── sql/
-│   ├── 00_create_db.sql           role + database creation
-│   ├── 01_schema.sql              tables, PKs, FKs, CHECK/UNIQUE constraints
-│   ├── 02_constraints_indexes.sql triggers + read views
-│   ├── 03_seed.sql                sample passengers/flights/seats
-│   └── 04_analytics_queries.sql   standalone occupancy/revenue queries
-├── src/
-│   ├── config.js
-│   ├── app.js                     Express app + central error handler
-│   ├── server.js                  entrypoint
-│   ├── db/pool.js                 pg Pool + withTransaction() helper
-│   ├── routes/                    thin route -> controller wiring
-│   ├── controllers/                HTTP parsing/shaping only
-│   ├── services/
-│   │   ├── booking.service.js      ALL transaction/locking logic
-│   │   ├── payment.service.js      simulated payment gateway
-│   │   └── lock-cleanup.service.js expired-lock release job
-│   └── utils/
-├── tests/
-│   ├── concurrency-test.js         THE demo: N users race for 1 seat
-│   └── api-smoke-test.js           full lifecycle end-to-end test
+├── docs/
+│   └── diagrams/
+│       ├── architecture.svg
+│       ├── er-diagram.svg
+│       └── concurrency-sequence.svg
+│
+├── frontend/
+│   └── ...
+│
 ├── scripts/
 │   ├── seed.js
 │   └── reset-db.sh
-├── frontend/                     minimal React/Vite demo client (see frontend/README.md)
-├── .env.example
-└── README.md
-```
-
----
-
-## 10. Interview questions this project should be able to answer
-
-**Q: What actually prevents a double-booking?**
-`SELECT ... FOR UPDATE` inside a transaction on the `flight_seat` row.
-It's a row-level exclusive lock held until COMMIT/ROLLBACK; a second
-transaction requesting the same row blocks until the first finishes,
-then re-reads the current (not stale) status. See [§6.1](#61-the-mechanism).
-
-**Q: Why pessimistic locking instead of optimistic locking (a version
-column + compare-and-swap)?**
-Both are valid for this problem. Pessimistic locking was chosen because
-seat booking is a short, cheap transaction with potentially high
-contention on popular seats (window/aisle on a full flight) — under
-contention, optimistic locking means many clients read, fail the
-version check, and have to retry, which wastes work and can starve
-under pathological load. Pessimistic locking makes losers fail once,
-immediately, with a clear reason, instead of retrying blindly. The
-trade-off: pessimistic locking holds a lock for the transaction's
-duration, so a slow client (or a slow payment gateway call) blocks
-others longer — which is why the payment call in `confirmBooking` is
-kept fast (simulated, no real network dependency) and why locks
-auto-expire via the cleanup job if a client disappears mid-flow.
-
-**Q: What if a user locks a seat and then never confirms or cancels?**
-The seat stays `LOCKED`, unbookable by anyone else, until
-`lock-cleanup.service.js` runs and releases anything past
-`SEAT_LOCK_TIMEOUT_MINUTES`. See [§5.4](#54-expired-lock-cleanup).
-
-**Q: How do you know the fix actually works, not just "should work in
-theory"?**
-`tests/concurrency-test.js` fires real concurrent HTTP requests (not a
-single-threaded simulation) at the same seat and asserts exactly one
-`201` and the rest `409`. Run at 5/10/20 concurrent requesters with
-consistent results — see §6.5 and §7.
-
-**Q: Why is `flight_seat` a separate table from `seat`?**
-Because status and price are per-flight, not per-seat-globally — seat
-`3A` is available on tomorrow's flight even though it's booked on
-today's, and business class seats cost more only because of a
-multiplier applied when the flight_seat row is created. Splitting them
-is what keeps the design in 3NF instead of duplicating seat metadata
-per flight or storing a flight-varying fact on a flight-independent
-table. See [§4](#4-schema-decisions-why-its-shaped-this-way).
-
-**Q: Why doesn't `booking_seat` have a UNIQUE constraint on
-`flight_seat_id`?**
-Because a seat legitimately gets booked, then cancelled, then booked
-again by someone else — those are two different, both-valid
-`booking_seat` rows referencing the same `flight_seat_id` at different
-times. The actual invariant — *no two simultaneously active bookings
-on one seat* — is a runtime state-machine property (`flight_seat.status`
-guarded by the row lock), not something a static uniqueness constraint
-can express, because uniqueness constraints can't see "still active."
-See [§4](#4-schema-decisions-why-its-shaped-this-way).
-
-**Q: What happens if the payment step throws an exception (not just
-returns FAILED)?**
-`withTransaction()` catches any thrown error, issues `ROLLBACK`, and
-re-throws to the HTTP layer as a 5xx. The whole transaction — including
-the earlier `UPDATE flight_seat` from the lock step in a prior request —
-is untouched because it was already committed in a separate,
-already-closed transaction; the seat stays `LOCKED` and will be cleaned
-up by the timeout job like any other abandoned confirmation attempt.
-
-**Q: How would you scale this to handle a real airline's traffic?**
-Out of scope for this project by design (see [§1](#1-why-this-project-exists)),
-but the honest answer: read-heavy endpoints (search, seat availability)
-scale horizontally trivially since they're plain reads; the write path
-(seat locking) is bounded by row-lock contention on whatever seat is
-currently "hot," which for a single seat is inherently serial no matter
-what — the real lever is keeping the locked critical section (between
-`FOR UPDATE` and `COMMIT`) as short as possible, which is why payment
-happens in `confirmBooking`'s own separate transaction rather than
-inside the initial lock.
-
-**Q: What's the difference between `LOCKED` (the `flight_seat.status`
-value) and the `FOR UPDATE` row lock?**
-Two different things with similar names. `FOR UPDATE` is a *transient*
-PostgreSQL row lock that exists only while a transaction is open and is
-released automatically on COMMIT/ROLLBACK. `status = 'LOCKED'` is
-*persisted application data* that outlives any single transaction —
-it's what tells the next request "this seat is reserved, pending
-payment" even after the locking transaction has already committed and
-released its row lock.
-
-**Q: Why raw SQL instead of an ORM?**
-The `SELECT ... FOR UPDATE` + explicit transaction boundary is the point
-of the project — an ORM's abstraction over both would hide exactly the
-mechanism this project exists to demonstrate.
-
----
-
-## 11. Environment variables (`.env`)
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `PORT` | `3000` | HTTP port for the API |
-| `PGHOST` | `localhost` | PostgreSQL host |
-| `PGPORT` | `5432` | PostgreSQL port |
-| `PGUSER` | `airline_user` | PostgreSQL user |
-| `PGPASSWORD` | `airline_pass` | PostgreSQL password |
-| `PGDATABASE` | `airline_db` | PostgreSQL database name |
-| `SEAT_LOCK_TIMEOUT_MINUTES` | `5` | How long a seat stays `LOCKED` before the cleanup job releases it |
+│
+├── sql/
+│   ├── 00_create_db.sql
+│   ├── 01_schema.sql
+│   ├── 02_constraints_indexes.sql
+│   ├── 03_seed.sql
+│   └── 04_analytics_queries.sql
+│
+├── src/
+│   ├── config.js
+│   ├── app.js
+│   ├── server.js
+│   │
+│   ├── db/
+│   │   └── pool.js
+│   │
+│   ├── routes/
+│   │   ├── flights.routes.js
+│   │   ├── bookings.routes.js
+│   │   ├── passengers.routes.js
+│   │   └── analytics.routes.js
+│   │
+│   ├── controllers/
+│   │   ├── flights.controller.js
+│   │   ├── bookings.controller.js
+│   │   ├── passengers.controller.js
+│   │   └── analytics.controller.js
+│   │
+│   ├── services/
+│   │   ├── booking.se
